@@ -255,30 +255,34 @@ apply_fcitx5_trigger() {
         return 0
     fi
     local b="${cfg}.bak-hhkb-$(date +%Y%m%d-%H%M%S)"
-    if [[ "$(grep -m1 '^0=' "$cfg")" == "0=Control+space" ]]; then
-        log "fcitx5: trigger already Control+space"
-        FCITX_STATE="already Control+space"
-        return 0
-    fi
     cp "$cfg" "$b"
     local out
-    out=$("$PYBIN" - "$cfg" <<'PYEOF' 2>&1
+    out=$("$PYBIN" - "$b" "$cfg" <<'PYEOF' 2>&1
 import re, sys
-p = sys.argv[1]
-s = open(p, encoding='utf-8', errors='replace').read()
-pat = re.compile(r'(\[Hotkey/TriggerKeys\]\n)(0=[^\n]*)')
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src, encoding='utf-8', errors='replace').read()
+# section-scoped: only a live '0=' line inside [Hotkey/TriggerKeys] counts --
+# other Hotkey sections (e.g. EnumerateGroupForwardKeys) may legitimately
+# carry '0=Control+space' and must not fool the idempotency check.
+pat = re.compile(r'\[Hotkey/TriggerKeys\]\n(0=[^\n]*)')
 m = pat.search(s)
 if not m:
     print("NONE")
+elif m.group(1) == '0=Control+space':
+    print("ALREADY")
 else:
-    open(p, 'w', encoding='utf-8').write(pat.sub(lambda mm: mm.group(1) + '0=Control+space', s, count=1))
-    print("OK was '%s'" % m.group(2))
+    open(dst, 'w', encoding='utf-8').write(pat.sub('[Hotkey/TriggerKeys]\\n0=Control+space', s, count=1))
+    print("OK was '%s'" % m.group(1))
 PYEOF
-) || { log "fcitx5: patch failed, kept backup $b"; FCITX_STATE="skipped (patch failed)"; return 0; }
+) || { log "fcitx5: patch failed, config untouched (backup kept: $b)"; FCITX_STATE="skipped (patch failed)"; return 0; }
     if [[ "$out" == NONE ]]; then
+        rm -f "$b"
         log "fcitx5: [Hotkey/TriggerKeys] with a live '0=' line not found — set TriggerKeys[0]=Control+space manually"
         FCITX_STATE="skipped (section absent; file untouched)"
+    elif [[ "$out" == ALREADY ]]; then
         rm -f "$b"
+        log "fcitx5: trigger already Control+space"
+        FCITX_STATE="already Control+space"
     else
         log "fcitx5: trigger rewritten -> Control+space (was ${out#OK was })  [backup: $b]"
         FCITX_STATE="rewritten to Control+space"

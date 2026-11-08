@@ -122,7 +122,49 @@ printf '[Hotkey/TriggerKeys]\n0=Caps_Lock\n1=Zenkaku_Hankaku\n2=Hangul\n' > "$TM
 TOSH_FCITX_CONFIG="$TMP/fxdir/config" bash "$APPLY" --skip-restart --no-fcitx5 --target "$TMP/fx.py" >"$TMP/t4.log" 2>&1
 grep -q '^0=Control+space' "$TMP/fxdir/config" && bad "T4 rewrote trigger despite --no-fcitx5" || ok "T4 skipped"
 
-echo "== T5: --skip-restart never calls systemctl (fake PATH) =="
+echo "== T6: fcitx5 already-check must be section-scoped (not file-wide) =="
+rm -rf "$TMP/fxdir3"; mkdir -p "$TMP/fxdir3"
+cat > "$TMP/fxdir3/config" <<'FCFG'
+[Hotkey/EnumerateGroupForwardKeys]
+0=Control+space
+
+[Hotkey/TriggerKeys]
+0=Caps_Lock
+1=Zenkaku_Hankaku
+FCFG
+TOSH_FCITX_CONFIG="$TMP/fxdir3/config" bash "$APPLY" --skip-restart --target "$TMP/fx.py" >"$TMP/t6.log" 2>&1
+first=$(awk '/^\[Hotkey\/TriggerKeys\]/{f=1;next} /^\[/{f=0} f && /^0=/{print; exit}' "$TMP/fxdir3/config")
+[[ "$first" == "0=Control+space" ]] && ok "T6 section-scoped rewrite" || bad "T6 trigger stays wrong: $first ($(grep 'fcitx5:' "$TMP/t6.log" | head -1))"
+
+echo "== T7: prefs DB without the table → graceful hint, no crash =="
+rm -f "$TMP/notable.sqlite"
+"$PY" -c "import sqlite3; sqlite3.connect('$TMP/notable.sqlite').close()"
+cp "$ORACLE" "$TMP/hand7.py"
+printf '# Cond modmap - User - Caps<->LCtrl full swap (hand variant)\n# User: Ctrl+Space for IME (fcitx5) passthrough\n' >> "$TMP/hand7.py"
+TOSH_PREFS_DB="$TMP/notable.sqlite" bash "$APPLY" --skip-restart --target "$TMP/hand7.py" >"$TMP/t7.log" 2>&1
+rc=$?
+[[ $rc -eq 0 ]] && ok "T7 exit 0" || bad "T7 exit=$rc (log: $TMP/t7.log)"
+grep -q "caps_is_caps" "$TMP/t7.log" && ok "T7 GUI hint printed" || bad "T7 no hint"
+
+echo "== T8: prefs DB absent → skip + no DB file created =="
+rm -f "$TMP/never.sqlite"
+cp "$ORACLE" "$TMP/hand8.py"
+printf '# Cond modmap - User - Caps<->LCtrl full swap (hand variant)\n# User: Ctrl+Space for IME (fcitx5) passthrough\n' >> "$TMP/hand8.py"
+TOSH_PREFS_DB="$TMP/never.sqlite" bash "$APPLY" --skip-restart --target "$TMP/hand8.py" >"$TMP/t8.log" 2>&1
+rc=$?
+[[ $rc -eq 0 ]] && ok "T8 exit 0" || bad "T8 exit=$rc (log: $TMP/t8.log)"
+[[ ! -e "$TMP/never.sqlite" ]] && ok "T8 no DB file created" || bad "T8 created a DB file"
+
+echo "== T9: prefs row absent (empty table) → INSERT fallback =="
+rm -f "$TMP/empty.sqlite"
+"$PY" -c "import sqlite3; con=sqlite3.connect('$TMP/empty.sqlite'); con.execute('CREATE TABLE config_preferences (name TEXT PRIMARY KEY, value TEXT)'); con.commit(); con.close()"
+cp "$ORACLE" "$TMP/hand9.py"
+printf '# Cond modmap - User - Caps<->LCtrl full swap (hand variant)\n# User: Ctrl+Space for IME (fcitx5) passthrough\n' >> "$TMP/hand9.py"
+TOSH_PREFS_DB="$TMP/empty.sqlite" bash "$APPLY" --skip-restart --target "$TMP/hand9.py" >"$TMP/t9.log" 2>&1
+v=$("$PY" -c "import sqlite3; print(sqlite3.connect('$TMP/empty.sqlite').execute(\"SELECT value FROM config_preferences WHERE name='capslock_mode'\").fetchone()[0])")
+[[ "$v" == "caps_is_caps" ]] && ok "T9 row inserted" || bad "T9 value=$v"
+
+
 cp "$ORACLE" "$TMP/fresh5.py"
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/systemctl" <<STUB

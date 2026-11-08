@@ -79,5 +79,67 @@ cmp -s "$TMP/noanchor.py" "$TMP/noanchor.orig" \
   && ok "S5 no write on failure" || bad "S5 touched file on failure"
 
 echo
+echo "== T1: capslock_mode via prefs DB (temp sqlite) =="
+cp "$ORACLE" "$TMP/prefs.py"
+"$PY" - "$TMP/prefs.sqlite" <<'PYEOF'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE config_preferences (name TEXT PRIMARY KEY, value TEXT)")
+con.execute("INSERT INTO config_preferences VALUES ('capslock_mode','caps_is_esc_and_lctrl_role_swap')")
+con.commit(); con.close()
+PYEOF
+TOSH_PREFS_DB="$TMP/prefs.sqlite" bash "$APPLY" --skip-restart --target "$TMP/prefs.py" >"$TMP/t1.log" 2>&1
+rc=$?
+[[ $rc -eq 0 ]] && ok "T1 exit 0" || bad "T1 exit=$rc (log: $TMP/t1.log)"
+v=$("$PY" - "$TMP/prefs.sqlite" <<'PYEOF'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT value FROM config_preferences WHERE name='capslock_mode'").fetchone()[0])
+PYEOF
+)
+[[ "$v" == "caps_is_caps" ]] && ok "T1 capslock_mode=caps_is_caps" || bad "T1 value=$v"
+
+echo "== T2: fcitx5 trigger rewritten, other entries intact =="
+cp "$ORACLE" "$TMP/fx.py"
+mkdir -p "$TMP/fxdir"
+printf '[Hotkey/TriggerKeys]\n0=Caps_Lock\n1=Zenkaku_Hankaku\n2=Hangul\n' > "$TMP/fxdir/config"
+TOSH_FCITX_CONFIG="$TMP/fxdir/config" bash "$APPLY" --skip-restart --target "$TMP/fx.py" >"$TMP/t2.log" 2>&1
+first=$(grep -m1 '^0=' "$TMP/fxdir/config")
+[[ "$first" == "0=Control+space" ]] && ok "T2 trigger entry" || bad "T2 trigger=$first"
+grep -q '^1=Zenkaku_Hankaku' "$TMP/fxdir/config" && grep -q '^2=Hangul' "$TMP/fxdir/config" \
+  && ok "T2 other entries intact" || bad "T2 other entries lost"
+ls "$TMP/fxdir"/config.bak-* >/dev/null 2>&1 && ok "T2 backup created" || bad "T2 no backup"
+
+echo "== T3: fcitx5 section absent → untouched + hint =="
+rm -rf "$TMP/fxdir2"; mkdir -p "$TMP/fxdir2"
+printf '[Behavior]\nPreeditEnabledByDefault=True\n' > "$TMP/fxdir2/config"
+cp "$TMP/fxdir2/config" "$TMP/fxdir2/before"
+TOSH_FCITX_CONFIG="$TMP/fxdir2/config" bash "$APPLY" --skip-restart --target "$TMP/fx.py" >"$TMP/t3.log" 2>&1
+cmp -s "$TMP/fxdir2/config" "$TMP/fxdir2/before" && ok "T3 untouched" || bad "T3 file changed"
+grep -qiE "manual|not found" "$TMP/t3.log" && ok "T3 hint printed" || bad "T3 no hint"
+
+echo "== T4: --no-fcitx5 leaves fcitx5 config alone =="
+printf '[Hotkey/TriggerKeys]\n0=Caps_Lock\n1=Zenkaku_Hankaku\n2=Hangul\n' > "$TMP/fxdir/config"
+TOSH_FCITX_CONFIG="$TMP/fxdir/config" bash "$APPLY" --skip-restart --no-fcitx5 --target "$TMP/fx.py" >"$TMP/t4.log" 2>&1
+grep -q '^0=Control+space' "$TMP/fxdir/config" && bad "T4 rewrote trigger despite --no-fcitx5" || ok "T4 skipped"
+
+echo "== T5: --skip-restart never calls systemctl (fake PATH) =="
+cp "$ORACLE" "$TMP/fresh5.py"
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/systemctl" <<STUB
+#!/usr/bin/env bash
+echo "systemctl called: \$*" >> "$TMP/stubtrace"
+exit 0
+STUB
+chmod +x "$TMP/bin/systemctl"
+TOSH_PREFS_DB="$TMP/prefs.sqlite" TOSH_FCITX_CONFIG="$TMP/fxdir/config" \
+  PATH="$TMP/bin:$PATH" bash "$APPLY" --skip-restart --target "$TMP/fresh5.py" >"$TMP/t5.log" 2>&1
+[[ ! -s "$TMP/stubtrace" ]] && ok "T5a --skip-restart → no systemctl call" || bad "T5a called systemctl despite flag"
+cp "$ORACLE" "$TMP/fresh5b.py"
+TOSH_PREFS_DB="$TMP/prefs.sqlite" TOSH_FCITX_CONFIG="$TMP/fxdir/config" \
+  PATH="$TMP/bin:$PATH" bash "$APPLY" --target "$TMP/fresh5b.py" >"$TMP/t5b.log" 2>&1
+[[ -s "$TMP/stubtrace" ]] && ok "T5 systemctl called without --skip-restart" || bad "T5 systemctl not called"
+rc=0
+
+echo
 echo "results: pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

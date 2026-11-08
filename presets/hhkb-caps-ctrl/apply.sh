@@ -193,16 +193,137 @@ if [[ $need_mod -ne 0 || $need_key -ne 0 ]]; then
 fi
 
 # --- preferences, fcitx5, service (configured in later presets steps) -------
-log "prefs: capslock_mode handling not part of this invocation (--no-op in engine-only mode)"
-log "fcitx5: $([[ $NO_FCITX5 -eq 1 ]] && echo 'skipped (--no-fcitx5)' || echo 'skipped (not configured by engine-only mode)')"
-if [[ $SKIP_RESTART -eq 0 && $need_mod -ne 0 || $need_key -ne 0 && $SKIP_RESTART -eq 0 ]]; then
-    systemctl --user restart toshy-config.service 2>/dev/null \
-        && log "service: toshy-config restarted" \
-        || warn "could not restart toshy-config.service (restart Toshy manually))"
+# --- preferences: capslock_mode = caps_is_caps -------------------------------
+set_caps_mode_pref() {
+    local db="${TOSH_PREFS_DB:-$HOME/.config/toshy/toshy_user_preferences.sqlite}"
+    if [[ ! -f "$db" ]]; then
+        log "prefs: DB not found at $db — set capslock_mode='caps_is_caps' via the Toshy GUI manually"
+        PREFS_STATE="skipped (DB not found)"
+        return 0
+    fi
+    local out
+    if ! out=$("$PYBIN" - "$db" <<'PYEOF' 2>&1
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    cur = con.cursor()
+    cur.execute("SELECT value FROM config_preferences WHERE name='capslock_mode'")
+    row = cur.fetchone()
+    state = row[0] if row else 'absent'
+    if state == 'caps_is_caps':
+        print("OK already caps_is_caps")
+        sys.exit(0)
+    cur.execute("UPDATE config_preferences SET value='caps_is_caps' WHERE name='capslock_mode'")
+    if cur.rowcount == 0:
+        cur.execute("INSERT INTO config_preferences (name, value) VALUES ('capslock_mode','caps_is_caps')")
+    con.commit()
+    print("OK %s -> caps_is_caps" % state)
+except sqlite3.Error as e:
+    print("SQLERR %s" % e)
+    sys.exit(1)
+finally:
+    con.close()
+PYEOF
+    ); then
+        log "prefs: FAILED — sqlite says: $out — set capslock_mode='caps_is_caps' via the Toshy GUI"
+        PREFS_STATE="skipped (sqlite issue)"
+        return 0
+    fi
+    if [[ "$out" == *SQLERR* || "$out" == *"NOCURSOR"* ]]; then
+        log "prefs: SQLITE LIMITATION: ${out#SQLERR } — set capslock_mode='caps_is_caps' via the Toshy GUI"
+        PREFS_STATE="skipped (sqlite issue)"
+    elif [[ "$out" == *already* ]]; then
+        log "prefs: capslock_mode already caps_is_caps"
+        PREFS_STATE="already caps_is_caps"
+    else
+        log "prefs: $out"
+        PREFS_STATE="set to caps_is_caps"
+    fi
+}
+
+# --- fcitx5: recorded trigger key -> Control+space ---------------------------
+apply_fcitx5_trigger() {
+    if [[ $NO_FCITX5 -eq 1 ]]; then
+        log "fcitx5: skipped (--no-fcitx5)"
+        FCITX_STATE="skipped (--no-fcitx5)"
+        return 0
+    fi
+    local cfg="${TOSH_FCITX_CONFIG:-$HOME/.config/fcitx5/config}"
+    if [[ ! -f "$cfg" ]]; then
+        log "fcitx5: not installed ($cfg absent) — Ctrl+Space works out of the box with ibus/GNOME; nothing to do"
+        FCITX_STATE="skipped (fcitx5 not present)"
+        return 0
+    fi
+    local b="${cfg}.bak-hhkb-$(date +%Y%m%d-%H%M%S)"
+    if [[ "$(grep -m1 '^0=' "$cfg")" == "0=Control+space" ]]; then
+        log "fcitx5: trigger already Control+space"
+        FCITX_STATE="already Control+space"
+        return 0
+    fi
+    cp "$cfg" "$b"
+    local out
+    out=$("$PYBIN" - "$cfg" <<'PYEOF' 2>&1
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+pat = re.compile(r'(\[Hotkey/TriggerKeys\]\n)(0=[^\n]*)')
+m = pat.search(s)
+if not m:
+    print("NONE")
+else:
+    open(p, 'w', encoding='utf-8').write(pat.sub(lambda mm: mm.group(1) + '0=Control+space', s, count=1))
+    print("OK was '%s'" % m.group(2))
+PYEOF
+) || { log "fcitx5: patch failed, kept backup $b"; FCITX_STATE="skipped (patch failed)"; return 0; }
+    if [[ "$out" == NONE ]]; then
+        log "fcitx5: [Hotkey/TriggerKeys] with a live '0=' line not found — set TriggerKeys[0]=Control+space manually"
+        FCITX_STATE="skipped (section absent; file untouched)"
+        rm -f "$b"
+    else
+        log "fcitx5: trigger rewritten -> Control+space (was ${out#OK was })  [backup: $b]"
+        FCITX_STATE="rewritten to Control+space"
+    fi
+}
+
+# --- service: restart toshy-config -------------------------------------------
+restart_toshy_config() {
+    if [[ $SKIP_RESTART -eq 1 ]]; then
+        log "service: skipped (--skip-restart)"
+        SVC_STATE="skipped (--skip-restart)"
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl unavailable — restart Toshy manually to load the changes"
+        SVC_STATE="skipped (no systemctl)"
+        return 0
+    fi
+    if systemctl --user restart toshy-config.service 2>/dev/null; then
+        log "service: toshy-config restarted"
+        SVC_STATE="restarted"
+    else
+        warn "could not restart toshy-config.service — restart Toshy manually"
+        SVC_STATE="failed (manual restart needed)"
+    fi
+}
+
+# --- run the remaining steps (prefs always idempotent; restart on change) ----
+PREFS_STATE="not touched"; FCITX_STATE="not touched"; SVC_STATE="not touched"
+set_caps_mode_pref
+apply_fcitx5_trigger
+if [[ $need_mod -ne 0 || $need_key -ne 0 || "$PREFS_STATE" == "set to caps_is_caps" || "$FCITX_STATE" == "rewritten to Control+space" ]]; then
+    restart_toshy_config
+else
+    SVC_STATE="skipped (nothing changed)"
+    log "service: nothing changed — no restart needed"
 fi
 
 log "modmap:  $state_mod"
 log "keymap:  $state_key"
+log "prefs:   $PREFS_STATE"
+log "fcitx5:  $FCITX_STATE"
+log "service: $SVC_STATE"
 [[ -n "$BACKUP" ]] && log "backup:  $BACKUP"
+log "upgrades: after a Toshy upgrade, re-run this script — the insertions may be" \
+    "regenerated away; the script is idempotent and will restore them."
 log "done."
 exit 0
